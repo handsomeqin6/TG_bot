@@ -39,10 +39,38 @@ def init_db() -> None:
             except Exception:
                 pass
 
+        # Global wallet index counter — only ever increases, never reset by /resetdb.
+        # This prevents address reuse after the users table is cleared.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS wallet_index_counter (
+                id      INTEGER PRIMARY KEY CHECK (id = 1),
+                next_idx INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        con.execute("INSERT OR IGNORE INTO wallet_index_counter (id, next_idx) VALUES (1, 0)")
+
+        # On first run after migration: seed counter from existing users data so
+        # we never re-derive an address that was already issued.
+        con.execute("""
+            UPDATE wallet_index_counter
+            SET next_idx = MAX(
+                next_idx,
+                COALESCE((SELECT MAX(wallet_idx) + 1 FROM users), 0)
+            )
+            WHERE id = 1
+        """)
+
 
 def next_wallet_index() -> int:
+    """Return the next wallet derivation index and advance the global counter.
+
+    The counter lives in wallet_index_counter and is never reset by /resetdb,
+    so addresses that were once issued are never re-derived for new users.
+    """
     with _conn() as con:
-        row = con.execute("SELECT COALESCE(MAX(wallet_idx) + 1, 0) FROM users").fetchone()
+        row = con.execute(
+            "UPDATE wallet_index_counter SET next_idx = next_idx + 1 WHERE id = 1 RETURNING next_idx - 1"
+        ).fetchone()
         return int(row[0])
 
 
