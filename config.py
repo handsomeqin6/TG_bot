@@ -5,7 +5,7 @@ load_dotenv()
 
 BOT_TOKEN: str = os.environ["BOT_TOKEN"]
 GROUP_ID: str = os.environ["GROUP_ID"]
-PAYMENT_AMOUNT: float = float(os.getenv("PAYMENT_AMOUNT", "2.0"))
+PAYMENT_AMOUNT: float = float(os.getenv("PAYMENT_AMOUNT", "15.0"))
 MNEMONIC: str = os.environ["MNEMONIC"]
 TRONGRID_API_KEY: str = os.getenv("TRONGRID_API_KEY", "")
 ADMIN_TG_ID: int = int(os.getenv("ADMIN_TG_ID", "0"))
