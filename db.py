@@ -83,10 +83,19 @@ def get_all_addresses() -> set:
 
 
 def get_uninvited_users() -> list:
-    """Return all users whose invite hasn't been sent yet (paid or unpaid), full row."""
+    """Return unpaid pending orders: paid=0 AND invite_sent=0."""
     with _conn() as con:
         rows = con.execute(
-            "SELECT * FROM users WHERE invite_sent = 0"
+            "SELECT * FROM users WHERE paid = 0 AND invite_sent = 0"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_paid_uninvited() -> list:
+    """Return paid orders that haven't received an invite yet: paid=1 AND invite_sent=0."""
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT * FROM users WHERE paid = 1 AND invite_sent = 0"
         ).fetchall()
         return [dict(r) for r in rows]
 

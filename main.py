@@ -221,75 +221,87 @@ async def cmd_checkbalance(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text("\n".join(lines))
 
 
+async def _send_invite(context: ContextTypes.DEFAULT_TYPE,
+                       tg_id: int, tx_id: str, amount_usdt: float) -> bool:
+    """Generate a one-time invite link, send it to the user, and notify the admin.
+    Returns True on success, False if the invite could not be sent."""
+    # Step 1 — generate one-time invite link and notify user
+    try:
+        expire = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+        link = await context.bot.create_chat_invite_link(
+            chat_id=GROUP_ID,
+            member_limit=1,
+            expire_date=expire,
+        )
+        await context.bot.send_message(
+            chat_id=tg_id,
+            text=(
+                "Payment confirmed! Here is your one-time invite link (valid 1 hour):\n"
+                "付款已确认！入群链接（1 小时内有效，仅限使用一次）：\n\n"
+                f"{link.invite_link}"
+            ),
+        )
+        db.mark_invite_sent(tg_id)
+        logger.info("Invite sent: user=%s", tg_id)
+    except Exception:
+        logger.exception("Failed to send invite to user %s", tg_id)
+        return False
+
+    # Step 2 — notify admin
+    if ADMIN_TG_ID:
+        now_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_TG_ID,
+                text=(
+                    "New Payment / 新付款通知\n\n"
+                    f"User ID / 用户ID: {tg_id}\n"
+                    f"Amount / 金额: {amount_usdt:.6f} USDT\n"
+                    f"TX / 交易: {tx_id or 'N/A'}\n"
+                    f"Time / 时间: {now_str}"
+                ),
+            )
+        except Exception:
+            logger.exception("Failed to send admin notification")
+    return True
+
+
 async def _poll_payments(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Poll pending orders every POLL_INTERVAL seconds.
 
+    Pass 1 — paid but not yet invited (paid=1, invite_sent=0):
+      These users already have confirmed payment; just send the invite link.
+
+    Pass 2 — unpaid pending orders (paid=0, invite_sent=0):
+      Query the blockchain; if a qualifying tx is found, mark paid and send invite.
+
     Gate: only processes users that have an existing DB record with invite_sent=0.
-    If the DB is empty (e.g. after /resetdb) get_uninvited_users() returns [] and
-    this function returns immediately — no blockchain queries are made.
+    If the DB is empty (e.g. after /resetdb) both queries return [] and this
+    function returns immediately — no blockchain queries are made.
     """
-    pending = db.get_uninvited_users()
-    if not pending:
-        return
+    # ── Pass 1: already paid, invite not yet sent ──────────────────────────
+    for user in db.get_paid_uninvited():
+        tg_id: int = user["tg_user_id"]
+        logger.info("Resending invite for already-paid user=%s", tg_id)
+        await _send_invite(context, tg_id, tx_id="", amount_usdt=PAYMENT_AMOUNT)
 
-    for user in pending:
-        tg_id: int      = user["tg_user_id"]
-        address: str    = user["address"]
+    # ── Pass 2: unpaid — check blockchain ─────────────────────────────────
+    for user in db.get_uninvited_users():
+        tg_id: int   = user["tg_user_id"]
+        address: str = user["address"]
 
-        # Step 1 — verify payment via on-chain transaction history only.
-        # A DB record with invite_sent=0 must already exist to reach this point.
-        if not user["paid"]:
-            result = await check_payment(address)
-            if result is None:
-                continue   # no confirmed tx found yet — wait for next poll cycle
-            db.mark_paid(tg_id)
-            tx_id       = result["tx_id"]
-            amount_usdt = result["amount_sun"] / 1_000_000
-            logger.info("Payment confirmed: user=%s tx=%s amount=%.6f USDT",
-                        tg_id, tx_id[:16] if tx_id else "N/A", amount_usdt)
-        else:
-            tx_id       = ""
-            amount_usdt = PAYMENT_AMOUNT
+        result = await check_payment(address)
+        if result is None:
+            continue   # no confirmed tx yet — wait for next poll cycle
 
-        # Step 2 — generate one-time invite link and notify user
-        try:
-            expire = datetime.now(tz=timezone.utc) + timedelta(hours=1)
-            link = await context.bot.create_chat_invite_link(
-                chat_id=GROUP_ID,
-                member_limit=1,
-                expire_date=expire,
-            )
-            await context.bot.send_message(
-                chat_id=tg_id,
-                text=(
-                    "Payment confirmed! Here is your one-time invite link (valid 1 hour):\n"
-                    "付款已确认！入群链接（1 小时内有效，仅限使用一次）：\n\n"
-                    f"{link.invite_link}"
-                ),
-            )
-            db.mark_invite_sent(tg_id)
-            logger.info("Invite sent: user=%s", tg_id)
-        except Exception:
-            logger.exception("Failed to send invite to user %s", tg_id)
-            continue
+        db.mark_paid(tg_id)
+        tx_id       = result["tx_id"]
+        amount_usdt = result["amount_sun"] / 1_000_000
+        logger.info("Payment confirmed: user=%s tx=%s amount=%.6f USDT",
+                    tg_id, tx_id[:16] if tx_id else "N/A", amount_usdt)
 
-        # Step 3 — notify admin
-        if ADMIN_TG_ID:
-            now_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-            try:
-                await context.bot.send_message(
-                    chat_id=ADMIN_TG_ID,
-                    text=(
-                        "New Payment / 新付款通知\n\n"
-                        f"User ID / 用户ID: {tg_id}\n"
-                        f"Amount / 金额: {amount_usdt:.6f} USDT\n"
-                        f"TX / 交易: {tx_id or 'N/A'}\n"
-                        f"Time / 时间: {now_str}"
-                    ),
-                )
-            except Exception:
-                logger.exception("Failed to send admin notification")
+        await _send_invite(context, tg_id, tx_id=tx_id, amount_usdt=amount_usdt)
 
 
 async def _check_expiry(context: ContextTypes.DEFAULT_TYPE) -> None:
