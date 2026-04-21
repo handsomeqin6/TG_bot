@@ -11,7 +11,7 @@ from config import (
     ADMIN_TG_ID, BOT_TOKEN, GROUP_ID, ORDER_TIMEOUT_HOURS,
     PAYMENT_AMOUNT, POLL_INTERVAL, TRONGRID_API_KEY, USDT_CONTRACT,
 )
-from monitor import check_payment, query_usdt_balance
+from monitor import check_payment
 
 _TG_HEADERS = {"Accept": "application/json", "TRON-PRO-API-KEY": TRONGRID_API_KEY}
 
@@ -114,11 +114,10 @@ async def cmd_checkorder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(f"No order found for user {target_id}.")
         return
 
-    # Determine status
-    paid         = bool(user["paid"])
-    invite_sent  = bool(user["invite_sent"])
-    reminded     = bool(user["expired_reminded"])
-    created_at   = user["created_at"]          # e.g. "2024-01-15 10:23:45"
+    paid        = bool(user["paid"])
+    invite_sent = bool(user["invite_sent"])
+    reminded    = bool(user["expired_reminded"])
+    created_at  = user["created_at"]
 
     if invite_sent:
         status = "completed (invite sent)"
@@ -127,7 +126,6 @@ async def cmd_checkorder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif reminded:
         status = "expired (reminder sent)"
     else:
-        # Check if past timeout window
         try:
             created_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
             if created_dt.tzinfo is None:
@@ -138,8 +136,8 @@ async def cmd_checkorder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             status = "pending"
 
     lines = [
-        f"Order / 订单详情",
-        f"",
+        "Order / 订单详情",
+        "",
         f"User ID     : {target_id}",
         f"Status      : {status}",
         f"Address     : {user['address']}",
@@ -203,14 +201,14 @@ async def cmd_checkbalance(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     usdt_display = usdt_sun / 1_000_000
 
     lines = [
-        f"On-chain Balance / 链上余额",
-        f"",
+        "On-chain Balance / 链上余额",
+        "",
         f"User ID : {target_id}",
         f"Address : {address}",
-        f"",
+        "",
         f"TRX     : {trx_display:.2f} TRX",
         f"USDT    : {usdt_display:.6f} USDT",
-        f"",
+        "",
     ]
     if usdt_sun == 0:
         lines.append("No USDT received yet.")
@@ -223,53 +221,34 @@ async def cmd_checkbalance(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def _poll_payments(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Poll pending orders every POLL_INTERVAL seconds.
+
+    Gate: only processes users that have an existing DB record with invite_sent=0.
+    If the DB is empty (e.g. after /resetdb) get_uninvited_users() returns [] and
+    this function returns immediately — no blockchain queries are made.
+    """
     pending = db.get_uninvited_users()
     if not pending:
         return
 
     for user in pending:
-        tg_id: int = user["tg_user_id"]
-        address: str = user["address"]
-        wallet_idx: int = user.get("wallet_idx", -1)
+        tg_id: int      = user["tg_user_id"]
+        address: str    = user["address"]
 
-        # Step 1 — confirm payment if not yet done
+        # Step 1 — verify payment via on-chain transaction history only.
+        # A DB record with invite_sent=0 must already exist to reach this point.
         if not user["paid"]:
             result = await check_payment(address)
-
-            # Balance fallback: only runs when a valid DB record exists (we are inside
-            # the _poll_payments loop) AND the order is older than 5 minutes.
-            # This prevents /resetdb-reuse false positives: a newly created order at
-            # the same index should not inherit old USDT sitting on that address.
             if result is None:
-                try:
-                    created_at = user.get("created_at", "")
-                    created_dt = datetime.fromisoformat(created_at)
-                    if created_dt.tzinfo is None:
-                        created_dt = created_dt.replace(tzinfo=timezone.utc)
-                    age_minutes = (datetime.now(tz=timezone.utc) - created_dt).total_seconds() / 60
-                    if age_minutes >= 5:
-                        balance_sun = await query_usdt_balance(address)
-                        if balance_sun >= round(PAYMENT_AMOUNT * 1_000_000):
-                            logger.info(
-                                "Payment confirmed (balance fallback, age=%.1fmin) "
-                                "user=%s address=%s balance=%d sun",
-                                age_minutes, tg_id, address, balance_sun,
-                            )
-                            result = {"tx_id": "", "amount_sun": balance_sun}
-                except Exception:
-                    logger.exception("Balance fallback error for user=%s", tg_id)
-
-            if result is None:
-                continue
+                continue   # no confirmed tx found yet — wait for next poll cycle
             db.mark_paid(tg_id)
-            tx_id      = result["tx_id"]
-            amount_sun  = result["amount_sun"]
-            amount_usdt = amount_sun / 1_000_000
+            tx_id       = result["tx_id"]
+            amount_usdt = result["amount_sun"] / 1_000_000
             logger.info("Payment confirmed: user=%s tx=%s amount=%.6f USDT",
-                        tg_id, tx_id[:16] if tx_id else "(balance)", amount_usdt)
-
+                        tg_id, tx_id[:16] if tx_id else "N/A", amount_usdt)
         else:
-            tx_id = ""
+            tx_id       = ""
             amount_usdt = PAYMENT_AMOUNT
 
         # Step 2 — generate one-time invite link and notify user
@@ -312,47 +291,6 @@ async def _poll_payments(context: ContextTypes.DEFAULT_TYPE) -> None:
                 logger.exception("Failed to send admin notification")
 
 
-async def _rescue_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Every 10 minutes: scan all derived addresses (index 0..max_known+5) and check
-    if any has sufficient USDT balance but NO corresponding DB record.
-    If found, notify admin so the order can be handled manually.
-
-    This catches payments made to addresses whose DB records were deleted (e.g. after /resetdb).
-    Normal missed-tx cases (record exists, paid=0) are handled by the balance fallback
-    inside check_payment() which runs every POLL_INTERVAL seconds.
-    """
-    known_addresses = db.get_all_addresses()
-    max_idx = db.next_wallet_index()          # MAX(wallet_idx) + 1
-    scan_up_to = max_idx + 5                  # a small buffer beyond known range
-
-    orphans = []
-    for idx in range(scan_up_to):
-        addr = wallet.derive_tron_address(idx)
-        if addr in known_addresses:
-            continue                           # already tracked — skip
-        balance_sun = await query_usdt_balance(addr)
-        if balance_sun >= round(PAYMENT_AMOUNT * 1_000_000):
-            orphans.append((idx, addr, balance_sun / 1_000_000))
-            logger.warning(
-                "Orphan address detected: idx=%d addr=%s balance=%.6f USDT",
-                idx, addr, balance_sun / 1_000_000,
-            )
-
-    if orphans and ADMIN_TG_ID:
-        lines = ["[RESCUE] Orphan address(es) with USDT balance detected:\n"]
-        for idx, addr, bal in orphans:
-            lines.append(f"  idx={idx}  bal={bal:.6f} USDT\n  {addr}")
-        lines.append("\nPlease check manually and send invite if needed.")
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_TG_ID,
-                text="\n".join(lines),
-            )
-        except Exception:
-            logger.exception("Failed to send orphan alert to admin")
-
-
 async def _check_expiry(context: ContextTypes.DEFAULT_TYPE) -> None:
     expiring = db.get_expiry_reminder_users(ORDER_TIMEOUT_HOURS)
     for user in expiring:
@@ -382,8 +320,7 @@ def main() -> None:
     app.add_handler(CommandHandler("checkbalance", cmd_checkbalance))
 
     app.job_queue.run_repeating(_poll_payments, interval=POLL_INTERVAL, first=15)
-    app.job_queue.run_repeating(_rescue_scan,   interval=600,          first=120)
-    app.job_queue.run_repeating(_check_expiry,  interval=3600,         first=60)
+    app.job_queue.run_repeating(_check_expiry,  interval=3600,          first=60)
 
     logger.info("Bot started. Polling every %ds.", POLL_INTERVAL)
     app.run_polling(drop_pending_updates=True)
