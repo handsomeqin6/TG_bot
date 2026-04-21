@@ -1,144 +1,256 @@
 """
-sweep.py — Sweep USDT from all paid derived addresses to the master wallet.
+sweep.py -- Standalone USDT collection script.
 
 Usage:
-    py sweep.py            # execute transfers
-    py sweep.py --dry-run  # preview only, no transactions sent
+    py sweep.py           # scan balances + interactive confirmation
+    py sweep.py --dry-run # scan only, no transactions
 """
 import argparse
-import os
-import sqlite3
 import sys
+import time
 
-from dotenv import load_dotenv
+import requests
 from tronpy import Tron
 from tronpy.keys import PrivateKey
-from tronpy.providers import HTTPProvider
-from bip_utils import Bip39SeedGenerator, Bip44, Bip44Changes, Bip44Coins
 
-load_dotenv()
+import db
+import wallet
+from config import (
+    MASTER_ADDRESS, MASTER_PRIVATE_KEY,
+    TRONGRID_API_KEY, USDT_CONTRACT,
+)
 
-MNEMONIC          = os.environ["MNEMONIC"]
-TRONGRID_API_KEY  = os.getenv("TRONGRID_API_KEY", "")
-USDT_CONTRACT     = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
-MASTER_ADDRESS    = "TCqzSozb1bF9ZzVWcvuH3VEcYfY5XcTo4v"
-DB_PATH           = "bot.db"
-FEE_LIMIT         = 30_000_000   # 30 TRX upper cap for energy fee
-MIN_SWEEP_SUN     = 10_000       # skip balances below 0.01 USDT (dust)
-LOW_TRX_WARN      = 15.0         # warn if TRX < 15 (may not cover gas)
+# -----------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------
+BASE_URL            = "https://api.trongrid.io"
+_HEADERS            = {"Accept": "application/json", "TRON-PRO-API-KEY": TRONGRID_API_KEY}
+_ACTIVATION_TRX_SUN = 5_000_000    # 5 TRX per unactivated address
+_SWEEP_FEE_LIMIT    = 15_000_000   # 15 TRX max fee for TRC20 transfer
+_MIN_USDT_SUN       = 100_000      # skip balances < 0.1 USDT (dust)
 
-# ── HD wallet ──────────────────────────────────────────────────────────────
 
-_seed_cache: bytes | None = None
+# -----------------------------------------------------------------------
+# Balance helpers (synchronous REST)
+# -----------------------------------------------------------------------
 
-def _seed() -> bytes:
-    global _seed_cache
-    if _seed_cache is None:
-        _seed_cache = Bip39SeedGenerator(MNEMONIC).Generate()
-    return _seed_cache
+def get_account_balances(address: str) -> tuple:
+    """
+    Returns (trx_sun: int, usdt_sun: int).
+    trx_sun == 0 means address is not yet activated on-chain.
+    """
+    try:
+        r = requests.get(
+            f"{BASE_URL}/v1/accounts/{address}",
+            headers=_HEADERS,
+            timeout=10,
+        )
+        data = r.json().get("data", [])
+    except Exception as e:
+        print(f"  [WARN] balance query failed for {address}: {e}")
+        return 0, 0
 
-def derive_private_key(index: int) -> str:
-    acc = (
-        Bip44.FromSeed(_seed(), Bip44Coins.TRON)
-        .Purpose()
-        .Coin()
-        .Account(0)
-        .Change(Bip44Changes.CHAIN_EXT)
-        .AddressIndex(index)
+    if not data:
+        return 0, 0   # address not activated
+
+    account  = data[0]
+    trx_sun  = account.get("balance", 0)
+    usdt_sun = 0
+    for item in account.get("trc20", []):
+        if USDT_CONTRACT in item:
+            usdt_sun = int(item[USDT_CONTRACT])
+    return trx_sun, usdt_sun
+
+
+def get_master_trx_sun() -> int:
+    trx, _ = get_account_balances(MASTER_ADDRESS)
+    return trx
+
+
+# -----------------------------------------------------------------------
+# Blockchain operations (tronpy, blocking)
+# -----------------------------------------------------------------------
+
+def send_trx(client: Tron, master_key: PrivateKey,
+             to_address: str, amount_sun: int) -> str:
+    """Send TRX from master to to_address. Returns txid."""
+    txn = (
+        client.trx.transfer(MASTER_ADDRESS, to_address, amount_sun)
+        .build()
+        .sign(master_key)
     )
-    return acc.PrivateKey().Raw().ToHex()
+    ret = txn.broadcast()
+    ret.wait()
+    return ret.get("txid", "?")
 
-# ── Database ────────────────────────────────────────────────────────────────
 
-def get_paid_rows() -> list[dict]:
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    rows = con.execute(
-        "SELECT tg_user_id, wallet_idx, address FROM users WHERE paid = 1"
-    ).fetchall()
-    con.close()
-    return [dict(r) for r in rows]
+def sweep_usdt(client: Tron, child_key: PrivateKey,
+               child_address: str, usdt_sun: int) -> str:
+    """Transfer usdt_sun from child_address to MASTER_ADDRESS. Returns txid."""
+    contract = client.get_contract(USDT_CONTRACT)
+    txn = (
+        contract.functions.transfer(MASTER_ADDRESS, usdt_sun)
+        .with_owner(child_address)
+        .fee_limit(_SWEEP_FEE_LIMIT)
+        .build()
+        .sign(child_key)
+    )
+    ret = txn.broadcast()
+    ret.wait()
+    return ret.get("txid", "?")
 
-# ── Main ────────────────────────────────────────────────────────────────────
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Sweep USDT to master wallet")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show balances and planned transfers without executing")
-    args = parser.parse_args()
+# -----------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------
 
-    # Build TronGrid client
-    provider = HTTPProvider("https://api.trongrid.io",
-                            api_key=TRONGRID_API_KEY or None)
-    client = Tron(provider)
-    usdt = client.get_contract(USDT_CONTRACT)
+def main(dry_run: bool) -> None:
+    db.init_db()
 
-    rows = get_paid_rows()
-    if not rows:
-        print("No paid addresses found in database.")
+    # ---- 1. Load all paid users ----------------------------------------
+    with db._conn() as con:
+        rows = con.execute(
+            "SELECT tg_user_id, wallet_idx, address FROM users WHERE paid = 1"
+        ).fetchall()
+    users = [dict(r) for r in rows]
+
+    if not users:
+        print("No paid users found in database.")
         return
 
-    print(f"Master address : {MASTER_ADDRESS}")
-    print(f"Scanning       : {len(rows)} paid address(es)")
-    print(f"Mode           : {'DRY RUN (no transactions)' if args.dry_run else 'LIVE'}")
-    print("-" * 60)
+    print(f"\nScanning {len(users)} paid address(es)...\n")
 
-    total_sun = 0
+    # ---- 2. Query balances --------------------------------------------
+    targets         = []
+    total_usdt_sun  = 0
+    need_activation = 0
 
-    for row in rows:
-        uid  = row["tg_user_id"]
-        idx  = row["wallet_idx"]
-        addr = row["address"]
+    for u in users:
+        addr    = u["address"]
+        idx     = u["wallet_idx"]
+        trx_sun, usdt_sun = get_account_balances(addr)
+        usdt      = usdt_sun / 1_000_000
+        trx       = trx_sun  / 1_000_000
+        activated = trx_sun > 0
 
-        # Check balances
+        status = "activated" if activated else "NOT activated"
+        print(f"  [{idx:>3}] {addr}  TRX={trx:.2f}  USDT={usdt:.6f}  ({status})")
+
+        if usdt_sun >= _MIN_USDT_SUN:
+            targets.append({
+                "address":    addr,
+                "wallet_idx": idx,
+                "trx_sun":    trx_sun,
+                "usdt_sun":   usdt_sun,
+                "activated":  activated,
+            })
+            total_usdt_sun += usdt_sun
+            if not activated:
+                need_activation += 1
+
+    # ---- 3. Summary report --------------------------------------------
+    trx_needed = need_activation * 5
+    print()
+    print("=" * 62)
+    print("SWEEP SUMMARY")
+    print("=" * 62)
+    print(f"  Addresses with USDT balance  : {len(targets)}")
+    print(f"  Unactivated (need 5 TRX each): {need_activation}")
+    print(f"  TRX required from master     : {trx_needed} TRX")
+    print(f"  Total USDT to collect        : {total_usdt_sun / 1_000_000:.6f} USDT")
+    print(f"  Destination (master)         : {MASTER_ADDRESS}")
+    print("=" * 62)
+
+    if not targets:
+        print("\nNothing to sweep.")
+        return
+
+    if dry_run:
+        print("\n[DRY-RUN] No transactions sent.")
+        return
+
+    # ---- 4. Confirm ---------------------------------------------------
+    print()
+    confirm = input("Type 'yes' to proceed with sweep: ").strip().lower()
+    if confirm != "yes":
+        print("Aborted.")
+        return
+
+    # ---- 5. Check master TRX balance ----------------------------------
+    master_trx_sun = get_master_trx_sun()
+    master_trx     = master_trx_sun / 1_000_000
+    trx_needed_sun = need_activation * _ACTIVATION_TRX_SUN
+
+    print(f"\nMaster TRX balance: {master_trx:.2f} TRX")
+    if master_trx_sun < trx_needed_sun:
+        shortfall = (trx_needed_sun - master_trx_sun) / 1_000_000
+        print(f"[ERROR] Insufficient TRX. Need {trx_needed} TRX, have {master_trx:.2f} TRX.")
+        print(f"        Please top up at least {shortfall:.2f} more TRX to:")
+        print(f"        {MASTER_ADDRESS}")
+        sys.exit(1)
+
+    print("TRX balance sufficient. Starting sweep...\n")
+
+    # ---- 6. Execute sweeps --------------------------------------------
+    client     = Tron()
+    master_key = PrivateKey(bytes.fromhex(MASTER_PRIVATE_KEY))
+
+    swept_count = 0
+    swept_usdt  = 0
+    failed      = 0
+
+    for t in targets:
+        addr      = t["address"]
+        idx       = t["wallet_idx"]
+        usdt_sun  = t["usdt_sun"]
+        activated = t["activated"]
+        usdt      = usdt_sun / 1_000_000
+
+        print(f"[{idx:>3}] {addr}")
+        print(f"      USDT: {usdt:.6f}")
+
+        child_key = PrivateKey(bytes.fromhex(wallet.derive_tron_privkey(idx)))
+
         try:
-            balance_sun = usdt.functions.balanceOf(addr)
+            # Step A -- activate address with 5 TRX if needed
+            if not activated:
+                print("      -> Sending 5 TRX for activation...")
+                txid_trx = send_trx(client, master_key, addr, _ACTIVATION_TRX_SUN)
+                print(f"      -> TRX tx: {txid_trx[:24]}...")
+                print("      -> Waiting 30 s for TRX to settle...")
+                time.sleep(30)
+
+            # Step B -- sweep USDT to master
+            print(f"      -> Sweeping {usdt:.6f} USDT to master...")
+            txid_usdt = sweep_usdt(client, child_key, addr, usdt_sun)
+            print(f"      -> USDT tx: {txid_usdt[:24]}...")
+            print("      -> OK\n")
+
+            swept_count += 1
+            swept_usdt  += usdt_sun
+
         except Exception as e:
-            print(f"[user {uid}] {addr}\n  ERROR reading USDT balance: {e}\n")
-            continue
+            print(f"      -> FAILED: {e}\n")
+            failed += 1
 
-        try:
-            trx_balance = client.get_account_balance(addr)
-        except Exception:
-            trx_balance = 0.0
-
-        balance_usdt = balance_sun / 1_000_000
-        print(f"[user {uid}] {addr}")
-        print(f"  USDT: {balance_usdt:.6f}  |  TRX: {trx_balance:.6f}")
-
-        if balance_sun < MIN_SWEEP_SUN:
-            print(f"  Skip (balance below dust threshold {MIN_SWEEP_SUN / 1_000_000} USDT)\n")
-            continue
-
-        if trx_balance < LOW_TRX_WARN:
-            print(f"  [WARN] TRX balance low ({trx_balance:.2f} TRX) - transfer may fail if energy is insufficient")
-
-        if args.dry_run:
-            print(f"  [DRY RUN] Would transfer {balance_usdt:.6f} USDT -> {MASTER_ADDRESS}\n")
-            total_sun += balance_sun
-            continue
-
-        # Sign and broadcast
-        priv_key = PrivateKey(bytes.fromhex(derive_private_key(idx)))
-        try:
-            txn = (
-                usdt.functions.transfer(MASTER_ADDRESS, balance_sun)
-                .with_owner(addr)
-                .fee_limit(FEE_LIMIT)
-                .build()
-                .sign(priv_key)
-            )
-            receipt = txn.broadcast().wait()
-            tx_id = receipt.get("txid") or receipt.get("id", "unknown")
-            print(f"  OK Transferred {balance_usdt:.6f} USDT  |  txid: {tx_id}\n")
-            total_sun += balance_sun
-        except Exception as e:
-            print(f"  FAIL Transfer failed: {e}\n")
-
-    print("-" * 60)
-    action = "Would sweep" if args.dry_run else "Swept"
-    print(f"{action} total: {total_sun / 1_000_000:.6f} USDT")
+    # ---- 7. Final report ----------------------------------------------
+    print("=" * 62)
+    print("SWEEP COMPLETE")
+    print("=" * 62)
+    print(f"  Successfully swept : {swept_count} address(es)")
+    print(f"  Total USDT swept   : {swept_usdt / 1_000_000:.6f} USDT")
+    if failed:
+        print(f"  Failed             : {failed} address(es)  <-- check logs above")
+    print("=" * 62)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Sweep USDT from paid child addresses to master wallet"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Scan and report only; do not send any transactions"
+    )
+    args = parser.parse_args()
+    main(dry_run=args.dry_run)

@@ -10,7 +10,7 @@ from config import (
     ADMIN_TG_ID, BOT_TOKEN, GROUP_ID, ORDER_TIMEOUT_HOURS,
     PAYMENT_AMOUNT, POLL_INTERVAL,
 )
-from monitor import auto_sweep, check_payment
+from monitor import check_payment
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -113,12 +113,6 @@ async def _poll_payments(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.info("Payment confirmed: user=%s tx=%s amount=%.6f USDT",
                         tg_id, tx_id[:16], amount_usdt)
 
-            # Step 1b — auto-sweep: activate child address then collect USDT back
-            if wallet_idx >= 0:
-                child_privkey = wallet.derive_tron_privkey(wallet_idx)
-                context.application.create_task(
-                    auto_sweep(address, child_privkey, amount_sun)
-                )
         else:
             tx_id = ""
             amount_usdt = PAYMENT_AMOUNT

@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import time
 from typing import Optional
@@ -6,7 +5,6 @@ from typing import Optional
 import aiohttp
 
 from config import (
-    MASTER_ADDRESS, MASTER_PRIVATE_KEY,
     PAYMENT_AMOUNT, REQUIRED_CONFIRMATIONS,
     TRONGRID_API_KEY, USDT_CONTRACT,
 )
@@ -19,9 +17,6 @@ _HEADERS = {"Accept": "application/json", "TRON-PRO-API-KEY": TRONGRID_API_KEY}
 REQUIRED_UNITS: int = round(PAYMENT_AMOUNT * 1_000_000)
 # TRON produces ~1 block every 3 seconds
 _TRON_BLOCK_INTERVAL_MS = 3_000
-
-# TRX to send for activation (in sun: 1 TRX = 1_000_000 sun)
-_ACTIVATION_TRX_SUN = 5_000_000   # 5 TRX
 
 # Base58 alphabet used by TRON (same as Bitcoin)
 _B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -135,7 +130,7 @@ async def _check_tx_list(
         if amount < REQUIRED_UNITS:
             continue
 
-        tx_id = tx.get("transaction_id", "")
+        tx_id    = tx.get("transaction_id", "")
         block_ts = tx.get("block_timestamp", 0)
 
         if _confirmed_by_timestamp(block_ts):
@@ -157,6 +152,10 @@ async def check_payment(address: str) -> Optional[dict]:
     """
     Returns {"tx_id": str, "amount_sun": int} when a confirmed USDT payment is found,
     or None if no qualifying transaction exists yet.
+
+    Query order:
+      1. /transactions/trc20  -- standard TRC20 Transfer events
+      2. /transactions        -- all tx types, ABI-parsed (GasFree fallback)
     """
     try:
         async with aiohttp.ClientSession(headers=_HEADERS) as session:
@@ -177,72 +176,3 @@ async def check_payment(address: str) -> Optional[dict]:
     except Exception:
         logger.exception("Payment check error for address %s", address)
     return None
-
-
-# ---------------------------------------------------------------------------
-# Auto-sweep: send TRX to activate child, then sweep USDT back to MASTER
-# ---------------------------------------------------------------------------
-
-def _do_sweep(child_address: str, child_privkey_hex: str, amount_sun: int) -> None:
-    """
-    Blocking helper (run in executor):
-      1. Send 5 TRX from MASTER to child (to cover energy fees)
-      2. Sleep 30 s (let the TRX land on-chain)
-      3. Transfer USDT from child back to MASTER
-    """
-    from tronpy import Tron
-    from tronpy.keys import PrivateKey
-
-    client = Tron()  # mainnet
-    master_key = PrivateKey(bytes.fromhex(MASTER_PRIVATE_KEY))
-    child_key  = PrivateKey(bytes.fromhex(child_privkey_hex))
-
-    # Step 1 — send 5 TRX from master to child
-    logger.info("Sweep step 1: sending 5 TRX from %s to %s", MASTER_ADDRESS, child_address)
-    txn = (
-        client.trx.transfer(MASTER_ADDRESS, child_address, _ACTIVATION_TRX_SUN)
-        .build()
-        .sign(master_key)
-    )
-    ret = txn.broadcast()
-    ret.wait()
-    logger.info("TRX sent, txid=%s", ret.get("txid", "?")[:16])
-
-    # Step 2 — wait for TRX to settle
-    logger.info("Sweep step 2: waiting 30 s for TRX to settle…")
-    time.sleep(30)
-
-    # Step 3 — sweep USDT from child to MASTER
-    logger.info(
-        "Sweep step 3: transferring %d sun USDT from %s to %s",
-        amount_sun, child_address, MASTER_ADDRESS,
-    )
-    contract = client.get_contract(USDT_CONTRACT)
-    txn2 = (
-        contract.functions.transfer(MASTER_ADDRESS, amount_sun)
-        .with_owner(child_address)
-        .fee_limit(15_000_000)   # 15 TRX max fee
-        .build()
-        .sign(child_key)
-    )
-    ret2 = txn2.broadcast()
-    ret2.wait()
-    logger.info("USDT swept, txid=%s", ret2.get("txid", "?")[:16])
-
-
-async def auto_sweep(child_address: str, child_privkey_hex: str, amount_sun: int) -> None:
-    """
-    Async wrapper: runs the blocking sweep in a thread so it doesn't block the bot.
-    Logs but never raises — a sweep failure must not prevent the invite link from being sent.
-    """
-    if not MASTER_ADDRESS or not MASTER_PRIVATE_KEY:
-        logger.warning("auto_sweep skipped: MASTER_ADDRESS or MASTER_PRIVATE_KEY not configured")
-        return
-    try:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None, _do_sweep, child_address, child_privkey_hex, amount_sun
-        )
-        logger.info("auto_sweep completed for %s", child_address)
-    except Exception:
-        logger.exception("auto_sweep failed for %s — sweep skipped", child_address)
