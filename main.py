@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime, timedelta, timezone
 
+import aiohttp
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -8,9 +9,11 @@ import db
 import wallet
 from config import (
     ADMIN_TG_ID, BOT_TOKEN, GROUP_ID, ORDER_TIMEOUT_HOURS,
-    PAYMENT_AMOUNT, POLL_INTERVAL,
+    PAYMENT_AMOUNT, POLL_INTERVAL, TRONGRID_API_KEY, USDT_CONTRACT,
 )
 from monitor import check_payment
+
+_TG_HEADERS = {"Accept": "application/json", "TRON-PRO-API-KEY": TRONGRID_API_KEY}
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -89,6 +92,134 @@ async def cmd_resetdb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"Done. Deleted {deleted} record(s) from the database.\n"
         f"已清空数据库，共删除 {deleted} 条订单记录。"
     )
+
+
+async def cmd_checkorder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_TG_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /checkorder <user_tg_id>")
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user ID.")
+        return
+
+    user = db.get_user(target_id)
+    if user is None:
+        await update.message.reply_text(f"No order found for user {target_id}.")
+        return
+
+    # Determine status
+    paid         = bool(user["paid"])
+    invite_sent  = bool(user["invite_sent"])
+    reminded     = bool(user["expired_reminded"])
+    created_at   = user["created_at"]          # e.g. "2024-01-15 10:23:45"
+
+    if invite_sent:
+        status = "completed (invite sent)"
+    elif paid:
+        status = "paid — waiting for invite"
+    elif reminded:
+        status = "expired (reminder sent)"
+    else:
+        # Check if past timeout window
+        try:
+            created_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            if created_dt.tzinfo is None:
+                created_dt = created_dt.replace(tzinfo=timezone.utc)
+            age_hours = (datetime.now(tz=timezone.utc) - created_dt).total_seconds() / 3600
+            status = f"expired (age {age_hours:.1f}h)" if age_hours > ORDER_TIMEOUT_HOURS else "pending"
+        except Exception:
+            status = "pending"
+
+    lines = [
+        f"Order / 订单详情",
+        f"",
+        f"User ID     : {target_id}",
+        f"Status      : {status}",
+        f"Address     : {user['address']}",
+        f"Wallet idx  : {user['wallet_idx']}",
+        f"Created at  : {created_at} UTC",
+        f"Paid        : {'Yes' if paid else 'No'}",
+        f"Invite sent : {'Yes' if invite_sent else 'No'}",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_checkbalance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_TG_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /checkbalance <user_tg_id>")
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user ID.")
+        return
+
+    user = db.get_user(target_id)
+    if user is None:
+        await update.message.reply_text(f"No order found for user {target_id}.")
+        return
+
+    address = user["address"]
+    await update.message.reply_text(f"Querying on-chain balance for:\n{address}\nPlease wait…")
+
+    try:
+        async with aiohttp.ClientSession(headers=_TG_HEADERS) as session:
+            async with session.get(
+                f"https://api.trongrid.io/v1/accounts/{address}",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                data = (await r.json(content_type=None)).get("data", [])
+    except Exception as e:
+        await update.message.reply_text(f"API query failed: {e}")
+        return
+
+    if not data:
+        await update.message.reply_text(
+            f"Address not activated on-chain yet (no TRX received).\n"
+            f"Address: {address}"
+        )
+        return
+
+    account  = data[0]
+    trx_sun  = account.get("balance", 0)
+    usdt_sun = 0
+    for item in account.get("trc20", []):
+        if USDT_CONTRACT in item:
+            usdt_sun = int(item[USDT_CONTRACT])
+
+    trx_display  = trx_sun  / 1_000_000
+    usdt_display = usdt_sun / 1_000_000
+
+    lines = [
+        f"On-chain Balance / 链上余额",
+        f"",
+        f"User ID : {target_id}",
+        f"Address : {address}",
+        f"",
+        f"TRX     : {trx_display:.2f} TRX",
+        f"USDT    : {usdt_display:.6f} USDT",
+        f"",
+    ]
+    if usdt_sun == 0:
+        lines.append("No USDT received yet.")
+    elif usdt_sun >= round(PAYMENT_AMOUNT * 1_000_000):
+        lines.append("Payment amount reached — funds confirmed on-chain.")
+    else:
+        lines.append(f"Insufficient USDT (need {PAYMENT_AMOUNT} USDT).")
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def _poll_payments(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -182,6 +313,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("resetdb", cmd_resetdb))
+    app.add_handler(CommandHandler("checkorder", cmd_checkorder))
+    app.add_handler(CommandHandler("checkbalance", cmd_checkbalance))
 
     app.job_queue.run_repeating(_poll_payments, interval=POLL_INTERVAL, first=15)
     app.job_queue.run_repeating(_check_expiry, interval=3600, first=60)
