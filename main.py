@@ -1,3 +1,4 @@
+# v2.0 - fixed polling logic
 import logging
 from datetime import datetime, timedelta, timezone
 
