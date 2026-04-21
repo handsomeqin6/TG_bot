@@ -235,14 +235,38 @@ async def _poll_payments(context: ContextTypes.DEFAULT_TYPE) -> None:
         # Step 1 — confirm payment if not yet done
         if not user["paid"]:
             result = await check_payment(address)
+
+            # Balance fallback: only runs when a valid DB record exists (we are inside
+            # the _poll_payments loop) AND the order is older than 5 minutes.
+            # This prevents /resetdb-reuse false positives: a newly created order at
+            # the same index should not inherit old USDT sitting on that address.
+            if result is None:
+                try:
+                    created_at = user.get("created_at", "")
+                    created_dt = datetime.fromisoformat(created_at)
+                    if created_dt.tzinfo is None:
+                        created_dt = created_dt.replace(tzinfo=timezone.utc)
+                    age_minutes = (datetime.now(tz=timezone.utc) - created_dt).total_seconds() / 60
+                    if age_minutes >= 5:
+                        balance_sun = await query_usdt_balance(address)
+                        if balance_sun >= round(PAYMENT_AMOUNT * 1_000_000):
+                            logger.info(
+                                "Payment confirmed (balance fallback, age=%.1fmin) "
+                                "user=%s address=%s balance=%d sun",
+                                age_minutes, tg_id, address, balance_sun,
+                            )
+                            result = {"tx_id": "", "amount_sun": balance_sun}
+                except Exception:
+                    logger.exception("Balance fallback error for user=%s", tg_id)
+
             if result is None:
                 continue
             db.mark_paid(tg_id)
-            tx_id     = result["tx_id"]
-            amount_sun = result["amount_sun"]
+            tx_id      = result["tx_id"]
+            amount_sun  = result["amount_sun"]
             amount_usdt = amount_sun / 1_000_000
             logger.info("Payment confirmed: user=%s tx=%s amount=%.6f USDT",
-                        tg_id, tx_id[:16], amount_usdt)
+                        tg_id, tx_id[:16] if tx_id else "(balance)", amount_usdt)
 
         else:
             tx_id = ""

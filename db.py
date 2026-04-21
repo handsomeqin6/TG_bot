@@ -83,10 +83,10 @@ def get_all_addresses() -> set:
 
 
 def get_uninvited_users() -> list:
-    """Return users whose invite hasn't been sent yet (paid or unpaid)."""
+    """Return all users whose invite hasn't been sent yet (paid or unpaid), full row."""
     with _conn() as con:
         rows = con.execute(
-            "SELECT tg_user_id, address, paid FROM users WHERE invite_sent = 0"
+            "SELECT * FROM users WHERE invite_sent = 0"
         ).fetchall()
         return [dict(r) for r in rows]
 

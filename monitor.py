@@ -185,7 +185,9 @@ async def check_payment(address: str) -> Optional[dict]:
     Query order:
       1. /transactions/trc20  -- standard TRC20 Transfer events
       2. /transactions        -- all tx types, ABI-parsed (GasFree fallback)
-      3. Balance check        -- direct balance query (catches missed / delayed tx indexing)
+
+    Balance-based fallback is intentionally kept in _poll_payments (main.py) so it
+    only fires when a valid pending DB record already exists for this address.
     """
     try:
         async with aiohttp.ClientSession(headers=_HEADERS) as session:
@@ -206,16 +208,6 @@ async def check_payment(address: str) -> Optional[dict]:
             result = await _check_tx_list(session, gen_txs, latest)
             if result:
                 return result
-
-            # Path 3 — balance fallback: catches any tx missed by both indexing endpoints
-            balance = await _usdt_balance(session, address)
-            logger.debug("Address %s: balance fallback=%d sun", address, balance)
-            if balance >= REQUIRED_UNITS:
-                logger.info(
-                    "Payment confirmed (balance fallback) address=%s balance=%d sun",
-                    address, balance,
-                )
-                return {"tx_id": "", "amount_sun": balance}
 
     except Exception:
         logger.exception("Payment check error for address %s", address)
