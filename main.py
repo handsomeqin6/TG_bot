@@ -52,20 +52,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     db.upsert_nowpayment(user_id, pay_address, payment_id)
 
-    pa_display = f"{pay_amount}"
-    pa_md = pa_display.replace('.', '\\.')
+    # Precise amount from NOWPayments; minimum display is PAYMENT_AMOUNT as integer
+    precise_md = str(pay_amount).replace('.', '\\.')
+    min_amt = int(PAYMENT_AMOUNT)   # e.g. 15
 
     text = (
-        f"Welcome\\! Please transfer *{pa_md} USDT* to the following TRC20 address:\n\n"
+        f"Welcome\\! Please send at least *{min_amt} USDT* \\(exact required: *{precise_md} USDT*\\) "
+        f"to the TRC20 address below:\n\n"
         f"`{pay_address}`\n\n"
         f"\\- TRC20 \\(TRON\\) network only\n"
-        f"\\- Exact amount: *{pa_md} USDT*\n"
+        f"\\- Send *{min_amt} USDT or more* — system requires {precise_md} USDT\n"
         f"\\- Invite link will be sent automatically after payment is confirmed\n"
         f"\\- If you have any questions, please contact @GermanSparrow1\n\n"
-        f"欢迎\\！请通过 *TRC20 网络* 向以下地址转入 *{pa_md} USDT*：\n\n"
+        f"欢迎\\！请通过 *TRC20 网络* 向以下地址付款：\n\n"
         f"`{pay_address}`\n\n"
         f"\\- 仅支持 TRC20（波场）网络\n"
-        f"\\- 请转入精确金额：*{pa_md} USDT*\n"
+        f"\\- 请转入不少于 *{min_amt} USDT*（实际需要 *{precise_md} USDT*）\n"
         f"\\- 付款确认后系统自动发送一次性入群链接\n"
         f"\\- 如有问题请联系 @GermanSparrow1"
     )
