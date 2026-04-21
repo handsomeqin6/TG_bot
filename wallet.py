@@ -14,9 +14,8 @@ def _seed() -> bytes:
     return _seed_cache
 
 
-def derive_tron_address(index: int) -> str:
-    """Derive a unique TRC20-compatible TRON address at BIP44 path m/44'/195'/0'/0/<index>."""
-    acc = (
+def _account(index: int):
+    return (
         Bip44.FromSeed(_seed(), Bip44Coins.TRON)
         .Purpose()
         .Coin()
@@ -24,4 +23,13 @@ def derive_tron_address(index: int) -> str:
         .Change(Bip44Changes.CHAIN_EXT)
         .AddressIndex(index)
     )
-    return acc.PublicKey().ToAddress()
+
+
+def derive_tron_address(index: int) -> str:
+    """Derive a unique TRC20-compatible TRON address at BIP44 path m/44'/195'/0'/0/<index>."""
+    return _account(index).PublicKey().ToAddress()
+
+
+def derive_tron_privkey(index: int) -> str:
+    """Return the hex private key (no 0x prefix) for the derived address at <index>."""
+    return _account(index).PrivateKey().Raw().ToHex()

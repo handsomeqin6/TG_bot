@@ -1,10 +1,15 @@
+import asyncio
 import logging
 import time
 from typing import Optional
 
 import aiohttp
 
-from config import PAYMENT_AMOUNT, REQUIRED_CONFIRMATIONS, TRONGRID_API_KEY, USDT_CONTRACT
+from config import (
+    MASTER_ADDRESS, MASTER_PRIVATE_KEY,
+    PAYMENT_AMOUNT, REQUIRED_CONFIRMATIONS,
+    TRONGRID_API_KEY, USDT_CONTRACT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +19,9 @@ _HEADERS = {"Accept": "application/json", "TRON-PRO-API-KEY": TRONGRID_API_KEY}
 REQUIRED_UNITS: int = round(PAYMENT_AMOUNT * 1_000_000)
 # TRON produces ~1 block every 3 seconds
 _TRON_BLOCK_INTERVAL_MS = 3_000
+
+# TRX to send for activation (in sun: 1 TRX = 1_000_000 sun)
+_ACTIVATION_TRX_SUN = 5_000_000   # 5 TRX
 
 # Base58 alphabet used by TRON (same as Bitcoin)
 _B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -69,7 +77,6 @@ async def _general_txs_for_usdt(session: aiohttp.ClientSession, address: str) ->
     results = []
 
     for tx in data.get("data", []):
-        # Only successfully executed transactions
         if tx.get("ret", [{}])[0].get("contractRet") != "SUCCESS":
             continue
         contracts = tx.get("raw_data", {}).get("contract", [])
@@ -79,16 +86,13 @@ async def _general_txs_for_usdt(session: aiohttp.ClientSession, address: str) ->
         if c.get("type") != "TriggerSmartContract":
             continue
         val = c.get("parameter", {}).get("value", {})
-        # Must target the USDT contract
         if val.get("contract_address") != USDT_CONTRACT:
             continue
 
         hex_data = val.get("data", "")
-        # Expect transfer(address,uint256): selector a9059cbb + 64-char addr + 64-char amount
         if len(hex_data) < 136 or hex_data[:8] != "a9059cbb":
             continue
 
-        # ABI address param is 32 bytes (64 hex), last 20 bytes (40 hex) = EVM address
         recipient_evm = hex_data[32:72]
         if recipient_evm.lower() != evm_target.lower():
             continue
@@ -105,10 +109,6 @@ async def _general_txs_for_usdt(session: aiohttp.ClientSession, address: str) ->
 
 
 async def _tx_block_number(session: aiohttp.ClientSession, tx_id: str) -> int:
-    """
-    Fetch exact block number via gettransactioninfobyid (full-node API).
-    /v1/transactions/{txid} returns 404 for TRC20 events — this endpoint works.
-    """
     async with session.post(
         f"{BASE_URL}/wallet/gettransactioninfobyid",
         json={"value": tx_id},
@@ -120,10 +120,6 @@ async def _tx_block_number(session: aiohttp.ClientSession, tx_id: str) -> int:
 
 
 def _confirmed_by_timestamp(block_timestamp_ms: int) -> bool:
-    """
-    Fast path: estimate confirmations from block_timestamp without an extra API call.
-    Adds a 20 % safety margin on top of the nominal block time.
-    """
     if not block_timestamp_ms:
         return False
     elapsed_ms = time.time() * 1000 - block_timestamp_ms
@@ -134,36 +130,23 @@ def _confirmed_by_timestamp(block_timestamp_ms: int) -> bool:
 async def _check_tx_list(
     session: aiohttp.ClientSession, txs: list, latest: int
 ) -> Optional[dict]:
-    """
-    Shared confirmation logic for both TRC20 and general tx lists.
-    Returns {"tx_id": str, "amount_sun": int} on the first confirmed tx, else None.
-    """
     for tx in txs:
         amount = int(tx.get("value", 0))
         if amount < REQUIRED_UNITS:
-            logger.debug(
-                "tx %s: amount %d < required %d, skip",
-                tx.get("transaction_id", "")[:16], amount, REQUIRED_UNITS,
-            )
             continue
 
         tx_id = tx.get("transaction_id", "")
         block_ts = tx.get("block_timestamp", 0)
 
         if _confirmed_by_timestamp(block_ts):
-            logger.info("Payment confirmed (timestamp path) tx=%s amount=%d", tx_id[:16], amount)
+            logger.info("Payment confirmed (timestamp) tx=%s amount=%d", tx_id[:16], amount)
             return {"tx_id": tx_id, "amount_sun": amount}
 
         if tx_id:
             block_num = await _tx_block_number(session, tx_id)
-            logger.debug(
-                "tx %s: block_num=%s latest=%s diff=%s",
-                tx_id[:16], block_num, latest,
-                (latest - block_num) if block_num else "n/a",
-            )
             if block_num and (latest - block_num) >= REQUIRED_CONFIRMATIONS:
                 logger.info(
-                    "Payment confirmed (block path) tx=%s block=%d latest=%d",
+                    "Payment confirmed (block) tx=%s block=%d latest=%d",
                     tx_id[:16], block_num, latest,
                 )
                 return {"tx_id": tx_id, "amount_sun": amount}
@@ -174,17 +157,13 @@ async def check_payment(address: str) -> Optional[dict]:
     """
     Returns {"tx_id": str, "amount_sun": int} when a confirmed USDT payment is found,
     or None if no qualifying transaction exists yet.
-
-    Query order:
-      1. /transactions/trc20  — standard TRC20 Transfer events
-      2. /transactions        — all tx types, ABI-parsed (GasFree fallback)
     """
     try:
         async with aiohttp.ClientSession(headers=_HEADERS) as session:
             latest = await _latest_block(session)
 
             trc20_txs = await _trc20_transfers(session, address)
-            logger.debug("Address %s: %d TRC20 record(s) found", address, len(trc20_txs))
+            logger.debug("Address %s: %d TRC20 record(s)", address, len(trc20_txs))
             trc20_txs = [t for t in trc20_txs if t.get("to") == address
                          and t.get("token_info", {}).get("address") == USDT_CONTRACT]
             result = await _check_tx_list(session, trc20_txs, latest)
@@ -192,9 +171,78 @@ async def check_payment(address: str) -> Optional[dict]:
                 return result
 
             gen_txs = await _general_txs_for_usdt(session, address)
-            logger.debug("Address %s: %d general USDT record(s) found", address, len(gen_txs))
+            logger.debug("Address %s: %d general USDT record(s)", address, len(gen_txs))
             return await _check_tx_list(session, gen_txs, latest)
 
     except Exception:
         logger.exception("Payment check error for address %s", address)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Auto-sweep: send TRX to activate child, then sweep USDT back to MASTER
+# ---------------------------------------------------------------------------
+
+def _do_sweep(child_address: str, child_privkey_hex: str, amount_sun: int) -> None:
+    """
+    Blocking helper (run in executor):
+      1. Send 5 TRX from MASTER to child (to cover energy fees)
+      2. Sleep 30 s (let the TRX land on-chain)
+      3. Transfer USDT from child back to MASTER
+    """
+    from tronpy import Tron
+    from tronpy.keys import PrivateKey
+
+    client = Tron()  # mainnet
+    master_key = PrivateKey(bytes.fromhex(MASTER_PRIVATE_KEY))
+    child_key  = PrivateKey(bytes.fromhex(child_privkey_hex))
+
+    # Step 1 — send 5 TRX from master to child
+    logger.info("Sweep step 1: sending 5 TRX from %s to %s", MASTER_ADDRESS, child_address)
+    txn = (
+        client.trx.transfer(MASTER_ADDRESS, child_address, _ACTIVATION_TRX_SUN)
+        .build()
+        .sign(master_key)
+    )
+    ret = txn.broadcast()
+    ret.wait()
+    logger.info("TRX sent, txid=%s", ret.get("txid", "?")[:16])
+
+    # Step 2 — wait for TRX to settle
+    logger.info("Sweep step 2: waiting 30 s for TRX to settle…")
+    time.sleep(30)
+
+    # Step 3 — sweep USDT from child to MASTER
+    logger.info(
+        "Sweep step 3: transferring %d sun USDT from %s to %s",
+        amount_sun, child_address, MASTER_ADDRESS,
+    )
+    contract = client.get_contract(USDT_CONTRACT)
+    txn2 = (
+        contract.functions.transfer(MASTER_ADDRESS, amount_sun)
+        .with_owner(child_address)
+        .fee_limit(15_000_000)   # 15 TRX max fee
+        .build()
+        .sign(child_key)
+    )
+    ret2 = txn2.broadcast()
+    ret2.wait()
+    logger.info("USDT swept, txid=%s", ret2.get("txid", "?")[:16])
+
+
+async def auto_sweep(child_address: str, child_privkey_hex: str, amount_sun: int) -> None:
+    """
+    Async wrapper: runs the blocking sweep in a thread so it doesn't block the bot.
+    Logs but never raises — a sweep failure must not prevent the invite link from being sent.
+    """
+    if not MASTER_ADDRESS or not MASTER_PRIVATE_KEY:
+        logger.warning("auto_sweep skipped: MASTER_ADDRESS or MASTER_PRIVATE_KEY not configured")
+        return
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, _do_sweep, child_address, child_privkey_hex, amount_sun
+        )
+        logger.info("auto_sweep completed for %s", child_address)
+    except Exception:
+        logger.exception("auto_sweep failed for %s — sweep skipped", child_address)

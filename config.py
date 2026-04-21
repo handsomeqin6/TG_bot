@@ -10,10 +10,10 @@ MNEMONIC: str = os.environ["MNEMONIC"]
 TRONGRID_API_KEY: str = os.getenv("TRONGRID_API_KEY", "")
 ADMIN_TG_ID: int = int(os.getenv("ADMIN_TG_ID", "0"))
 
-# NOWPayments
-NOWPAYMENTS_API_KEY: str = os.getenv("NOWPAYMENTS_API_KEY", "")
-NOWPAYMENTS_IPN_SECRET: str = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
-NOWPAYMENTS_IPN_URL: str = os.getenv("NOWPAYMENTS_IPN_URL", "")
+
+# Master wallet for auto-sweep (receives collected USDT)
+MASTER_ADDRESS: str = os.getenv("MASTER_ADDRESS", "")
+MASTER_PRIVATE_KEY: str = os.getenv("MASTER_PRIVATE_KEY", "")
 
 # Official TRC20-USDT contract on TRON mainnet
 USDT_CONTRACT: str = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
