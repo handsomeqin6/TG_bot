@@ -1,0 +1,9 @@
+.env
+orders.db
+bot.db
+main_out.txt
+*.txt.log
+.claude/
+__pycache__/
+*.pyc
+*.pyo
