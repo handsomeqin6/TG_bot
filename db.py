@@ -129,10 +129,20 @@ def get_paid_uninvited() -> list:
 
 
 def reset_all_users() -> int:
-    """Delete all rows from users table. Returns number of deleted rows."""
+    """Delete all rows from users table and advance the wallet index counter by 100.
+
+    Advancing the counter ensures that after a reset, new users are always
+    assigned fresh, never-used addresses — preventing false payment triggers
+    from residual on-chain balances on previously issued addresses.
+    Returns the number of deleted user rows.
+    """
     with _conn() as con:
         cur = con.execute("DELETE FROM users")
-        return cur.rowcount
+        deleted = cur.rowcount
+        con.execute(
+            "UPDATE wallet_index_counter SET next_idx = next_idx + 100 WHERE id = 1"
+        )
+        return deleted
 
 
 def mark_paid(tg_user_id: int) -> None:

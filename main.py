@@ -89,9 +89,13 @@ async def cmd_resetdb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Unauthorized.")
         return
     deleted = db.reset_all_users()
+    with db._conn() as con:
+        row = con.execute("SELECT next_idx FROM wallet_index_counter WHERE id = 1").fetchone()
+        new_idx = row[0] if row else "?"
     await update.message.reply_text(
-        f"Done. Deleted {deleted} record(s) from the database.\n"
-        f"已清空数据库，共删除 {deleted} 条订单记录。"
+        f"Done. Deleted {deleted} record(s). Wallet counter advanced by 100 (now {new_idx}).\n"
+        f"已清空数据库，共删除 {deleted} 条记录。钱包计数器 +100（当前值：{new_idx}），"
+        f"后续新用户将从全新地址开始。"
     )
 
 
