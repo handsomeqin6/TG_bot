@@ -122,6 +122,35 @@ def _confirmed_by_timestamp(block_timestamp_ms: int) -> bool:
     return estimated_blocks >= REQUIRED_CONFIRMATIONS * 1.2
 
 
+async def _usdt_balance(session: aiohttp.ClientSession, address: str) -> int:
+    """
+    Query current on-chain USDT balance for address via account endpoint.
+    Returns amount in sun; 0 if address not activated or holds no USDT.
+    """
+    try:
+        async with session.get(
+            f"{BASE_URL}/v1/accounts/{address}",
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            if r.status != 200:
+                return 0
+            data = (await r.json(content_type=None)).get("data", [])
+    except Exception:
+        return 0
+    if not data:
+        return 0
+    for item in data[0].get("trc20", []):
+        if USDT_CONTRACT in item:
+            return int(item[USDT_CONTRACT])
+    return 0
+
+
+async def query_usdt_balance(address: str) -> int:
+    """Public helper: return current USDT balance (sun) for any address."""
+    async with aiohttp.ClientSession(headers=_HEADERS) as session:
+        return await _usdt_balance(session, address)
+
+
 async def _check_tx_list(
     session: aiohttp.ClientSession, txs: list, latest: int
 ) -> Optional[dict]:
@@ -156,11 +185,13 @@ async def check_payment(address: str) -> Optional[dict]:
     Query order:
       1. /transactions/trc20  -- standard TRC20 Transfer events
       2. /transactions        -- all tx types, ABI-parsed (GasFree fallback)
+      3. Balance check        -- direct balance query (catches missed / delayed tx indexing)
     """
     try:
         async with aiohttp.ClientSession(headers=_HEADERS) as session:
             latest = await _latest_block(session)
 
+            # Path 1 — standard TRC20 transfer events
             trc20_txs = await _trc20_transfers(session, address)
             logger.debug("Address %s: %d TRC20 record(s)", address, len(trc20_txs))
             trc20_txs = [t for t in trc20_txs if t.get("to") == address
@@ -169,9 +200,22 @@ async def check_payment(address: str) -> Optional[dict]:
             if result:
                 return result
 
+            # Path 2 — general transactions, ABI-parsed (GasFree / non-standard)
             gen_txs = await _general_txs_for_usdt(session, address)
             logger.debug("Address %s: %d general USDT record(s)", address, len(gen_txs))
-            return await _check_tx_list(session, gen_txs, latest)
+            result = await _check_tx_list(session, gen_txs, latest)
+            if result:
+                return result
+
+            # Path 3 — balance fallback: catches any tx missed by both indexing endpoints
+            balance = await _usdt_balance(session, address)
+            logger.debug("Address %s: balance fallback=%d sun", address, balance)
+            if balance >= REQUIRED_UNITS:
+                logger.info(
+                    "Payment confirmed (balance fallback) address=%s balance=%d sun",
+                    address, balance,
+                )
+                return {"tx_id": "", "amount_sun": balance}
 
     except Exception:
         logger.exception("Payment check error for address %s", address)

@@ -75,6 +75,13 @@ def upsert_nowpayment(tg_user_id: int, pay_address: str, payment_id: str) -> Non
         """, (tg_user_id, tg_user_id, pay_address, payment_id))
 
 
+def get_all_addresses() -> set:
+    """Return a set of all addresses currently in the DB."""
+    with _conn() as con:
+        rows = con.execute("SELECT address FROM users").fetchall()
+        return {r["address"] for r in rows}
+
+
 def get_uninvited_users() -> list:
     """Return users whose invite hasn't been sent yet (paid or unpaid)."""
     with _conn() as con:

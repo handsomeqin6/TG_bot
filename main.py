@@ -11,7 +11,7 @@ from config import (
     ADMIN_TG_ID, BOT_TOKEN, GROUP_ID, ORDER_TIMEOUT_HOURS,
     PAYMENT_AMOUNT, POLL_INTERVAL, TRONGRID_API_KEY, USDT_CONTRACT,
 )
-from monitor import check_payment
+from monitor import check_payment, query_usdt_balance
 
 _TG_HEADERS = {"Accept": "application/json", "TRON-PRO-API-KEY": TRONGRID_API_KEY}
 
@@ -288,6 +288,47 @@ async def _poll_payments(context: ContextTypes.DEFAULT_TYPE) -> None:
                 logger.exception("Failed to send admin notification")
 
 
+async def _rescue_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Every 10 minutes: scan all derived addresses (index 0..max_known+5) and check
+    if any has sufficient USDT balance but NO corresponding DB record.
+    If found, notify admin so the order can be handled manually.
+
+    This catches payments made to addresses whose DB records were deleted (e.g. after /resetdb).
+    Normal missed-tx cases (record exists, paid=0) are handled by the balance fallback
+    inside check_payment() which runs every POLL_INTERVAL seconds.
+    """
+    known_addresses = db.get_all_addresses()
+    max_idx = db.next_wallet_index()          # MAX(wallet_idx) + 1
+    scan_up_to = max_idx + 5                  # a small buffer beyond known range
+
+    orphans = []
+    for idx in range(scan_up_to):
+        addr = wallet.derive_tron_address(idx)
+        if addr in known_addresses:
+            continue                           # already tracked — skip
+        balance_sun = await query_usdt_balance(addr)
+        if balance_sun >= round(PAYMENT_AMOUNT * 1_000_000):
+            orphans.append((idx, addr, balance_sun / 1_000_000))
+            logger.warning(
+                "Orphan address detected: idx=%d addr=%s balance=%.6f USDT",
+                idx, addr, balance_sun / 1_000_000,
+            )
+
+    if orphans and ADMIN_TG_ID:
+        lines = ["[RESCUE] Orphan address(es) with USDT balance detected:\n"]
+        for idx, addr, bal in orphans:
+            lines.append(f"  idx={idx}  bal={bal:.6f} USDT\n  {addr}")
+        lines.append("\nPlease check manually and send invite if needed.")
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_TG_ID,
+                text="\n".join(lines),
+            )
+        except Exception:
+            logger.exception("Failed to send orphan alert to admin")
+
+
 async def _check_expiry(context: ContextTypes.DEFAULT_TYPE) -> None:
     expiring = db.get_expiry_reminder_users(ORDER_TIMEOUT_HOURS)
     for user in expiring:
@@ -317,7 +358,8 @@ def main() -> None:
     app.add_handler(CommandHandler("checkbalance", cmd_checkbalance))
 
     app.job_queue.run_repeating(_poll_payments, interval=POLL_INTERVAL, first=15)
-    app.job_queue.run_repeating(_check_expiry, interval=3600, first=60)
+    app.job_queue.run_repeating(_rescue_scan,   interval=600,          first=120)
+    app.job_queue.run_repeating(_check_expiry,  interval=3600,         first=60)
 
     logger.info("Bot started. Polling every %ds.", POLL_INTERVAL)
     app.run_polling(drop_pending_updates=True)
