@@ -11,6 +11,12 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
+# Addresses permanently excluded from payment polling.
+# Add any address that should never trigger payment confirmation or invite sending.
+BLACKLISTED_ADDRESSES: set = {
+    "TSp3Ns6YcQxSRaNEXPfnT9FuZMkxs5papg",  # residual 1.5 USDT, no valid order
+}
+
 BASE_URL = "https://api.trongrid.io"
 _HEADERS = {"Accept": "application/json", "TRON-PRO-API-KEY": TRONGRID_API_KEY}
 # USDT has 6 decimal places; pre-compute the minimum amount in "sun" units
@@ -186,9 +192,11 @@ async def check_payment(address: str) -> Optional[dict]:
       1. /transactions/trc20  -- standard TRC20 Transfer events
       2. /transactions        -- all tx types, ABI-parsed (GasFree fallback)
 
-    Balance-based fallback is intentionally kept in _poll_payments (main.py) so it
-    only fires when a valid pending DB record already exists for this address.
+    Addresses in BLACKLISTED_ADDRESSES are always skipped and return None immediately.
     """
+    if address in BLACKLISTED_ADDRESSES:
+        logger.debug("Address %s is blacklisted — skipping", address)
+        return None
     try:
         async with aiohttp.ClientSession(headers=_HEADERS) as session:
             latest = await _latest_block(session)
