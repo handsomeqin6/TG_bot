@@ -91,6 +91,17 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_resetdb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_TG_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+    deleted = db.reset_all_users()
+    await update.message.reply_text(
+        f"Done. Deleted {deleted} record(s) from the database.\n"
+        f"已清空数据库，共删除 {deleted} 条订单记录。"
+    )
+
+
 async def _check_expiry(context: ContextTypes.DEFAULT_TYPE) -> None:
     expiring = db.get_expiry_reminder_users(ORDER_TIMEOUT_HOURS)
     for user in expiring:
@@ -115,6 +126,7 @@ def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("resetdb", cmd_resetdb))
 
     # Check for expired orders every hour
     app.job_queue.run_repeating(_check_expiry, interval=3600, first=60)

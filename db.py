@@ -84,6 +84,13 @@ def get_uninvited_users() -> list:
         return [dict(r) for r in rows]
 
 
+def reset_all_users() -> int:
+    """Delete all rows from users table. Returns number of deleted rows."""
+    with _conn() as con:
+        cur = con.execute("DELETE FROM users")
+        return cur.rowcount
+
+
 def mark_paid(tg_user_id: int) -> None:
     with _conn() as con:
         con.execute("UPDATE users SET paid = 1 WHERE tg_user_id = ?", (tg_user_id,))
