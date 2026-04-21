@@ -304,6 +304,19 @@ async def _poll_payments(context: ContextTypes.DEFAULT_TYPE) -> None:
         await _send_invite(context, tg_id, tx_id=tx_id, amount_usdt=amount_usdt)
 
 
+async def cmd_resetcounter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set wallet_index_counter.next_idx to 10, skipping all previously used addresses."""
+    if update.effective_user.id != ADMIN_TG_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+    with db._conn() as con:
+        con.execute("UPDATE wallet_index_counter SET next_idx = 10 WHERE id = 1")
+    await update.message.reply_text(
+        "Done. wallet_index_counter.next_idx set to 10.\n"
+        "计数器已设为 10，后续新用户将从地址索引 10 开始派生。"
+    )
+
+
 async def cmd_dbinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """[TEMP] Show Railway DB state — admin only."""
     if update.effective_user.id != ADMIN_TG_ID:
@@ -373,7 +386,8 @@ def main() -> None:
     app.add_handler(CommandHandler("resetdb", cmd_resetdb))
     app.add_handler(CommandHandler("checkorder", cmd_checkorder))
     app.add_handler(CommandHandler("checkbalance", cmd_checkbalance))
-    app.add_handler(CommandHandler("dbinfo", cmd_dbinfo))  # TEMP
+    app.add_handler(CommandHandler("dbinfo", cmd_dbinfo))           # TEMP
+    app.add_handler(CommandHandler("resetcounter", cmd_resetcounter))  # TEMP
 
     app.job_queue.run_repeating(_poll_payments, interval=POLL_INTERVAL, first=15)
     app.job_queue.run_repeating(_check_expiry,  interval=3600,          first=60)
