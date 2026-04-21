@@ -304,6 +304,48 @@ async def _poll_payments(context: ContextTypes.DEFAULT_TYPE) -> None:
         await _send_invite(context, tg_id, tx_id=tx_id, amount_usdt=amount_usdt)
 
 
+async def cmd_dbinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """[TEMP] Show Railway DB state — admin only."""
+    if update.effective_user.id != ADMIN_TG_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+
+    lines = ["DB Info / 数据库状态\n"]
+
+    with db._conn() as con:
+        # 1. wallet_index_counter
+        try:
+            row = con.execute("SELECT next_idx FROM wallet_index_counter WHERE id = 1").fetchone()
+            if row:
+                lines.append(f"wallet_index_counter.next_idx = {row[0]}")
+            else:
+                lines.append("wallet_index_counter: table exists but no row found")
+        except Exception as e:
+            lines.append(f"wallet_index_counter: NOT FOUND ({e})")
+
+        lines.append("")
+
+        # 2. users table
+        try:
+            rows = con.execute(
+                "SELECT tg_user_id, wallet_idx, address, paid, invite_sent FROM users"
+            ).fetchall()
+            if rows:
+                lines.append(f"users ({len(rows)} record(s)):")
+                for r in rows:
+                    lines.append(
+                        f"  uid={r['tg_user_id']} idx={r['wallet_idx']} "
+                        f"paid={r['paid']} inv={r['invite_sent']}\n"
+                        f"  addr={r['address']}"
+                    )
+            else:
+                lines.append("users: (empty)")
+        except Exception as e:
+            lines.append(f"users: query failed ({e})")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def _check_expiry(context: ContextTypes.DEFAULT_TYPE) -> None:
     expiring = db.get_expiry_reminder_users(ORDER_TIMEOUT_HOURS)
     for user in expiring:
@@ -331,6 +373,7 @@ def main() -> None:
     app.add_handler(CommandHandler("resetdb", cmd_resetdb))
     app.add_handler(CommandHandler("checkorder", cmd_checkorder))
     app.add_handler(CommandHandler("checkbalance", cmd_checkbalance))
+    app.add_handler(CommandHandler("dbinfo", cmd_dbinfo))  # TEMP
 
     app.job_queue.run_repeating(_poll_payments, interval=POLL_INTERVAL, first=15)
     app.job_queue.run_repeating(_check_expiry,  interval=3600,          first=60)
