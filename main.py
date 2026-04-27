@@ -228,8 +228,21 @@ async def cmd_checkbalance(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def _send_invite(context: ContextTypes.DEFAULT_TYPE,
                        tg_id: int, tx_id: str, amount_usdt: float) -> bool:
     """Generate a one-time invite link, send it to the user, and notify the admin.
-    Returns True on success, False if the invite could not be sent."""
-    # Step 1 — generate one-time invite link and notify user
+
+    Order of operations (crash-safe):
+      1. Create the invite link (reversible — unused links expire harmlessly)
+      2. Mark invite_sent=1 in DB  ← before sending, so a crash here never
+         causes a second invite to be issued on the next poll cycle
+      3. Send the link to the user
+      4. Notify admin
+
+    If step 3 fails the user can contact the admin; the link exists and is
+    valid for 1 hour.  This is safer than the alternative (duplicate invites
+    that let extra people into the group).
+
+    Returns True on success, False if the invite link could not be created.
+    """
+    # Step 1 — create invite link (fail early before touching DB)
     try:
         expire = datetime.now(tz=timezone.utc) + timedelta(hours=1)
         link = await context.bot.create_chat_invite_link(
@@ -237,6 +250,16 @@ async def _send_invite(context: ContextTypes.DEFAULT_TYPE,
             member_limit=1,
             expire_date=expire,
         )
+    except Exception:
+        logger.exception("Failed to create invite link for user %s", tg_id)
+        return False
+
+    # Step 2 — mark DB before sending so a crash here cannot cause a duplicate
+    db.mark_invite_sent(tg_id)
+    logger.info("Invite created and DB marked: user=%s", tg_id)
+
+    # Step 3 — deliver link to user (best-effort; admin notified regardless)
+    try:
         await context.bot.send_message(
             chat_id=tg_id,
             text=(
@@ -245,13 +268,14 @@ async def _send_invite(context: ContextTypes.DEFAULT_TYPE,
                 f"{link.invite_link}"
             ),
         )
-        db.mark_invite_sent(tg_id)
-        logger.info("Invite sent: user=%s", tg_id)
+        logger.info("Invite message delivered: user=%s", tg_id)
     except Exception:
-        logger.exception("Failed to send invite to user %s", tg_id)
-        return False
+        logger.exception(
+            "Invite link created but message delivery failed for user %s — "
+            "admin notification will still be sent with the link", tg_id
+        )
 
-    # Step 2 — notify admin
+    # Step 4 — notify admin (always, even if user delivery failed)
     if ADMIN_TG_ID:
         now_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         try:
@@ -262,7 +286,8 @@ async def _send_invite(context: ContextTypes.DEFAULT_TYPE,
                     f"User ID / 用户ID: {tg_id}\n"
                     f"Amount / 金额: {amount_usdt:.6f} USDT\n"
                     f"TX / 交易: {tx_id or 'N/A'}\n"
-                    f"Time / 时间: {now_str}"
+                    f"Time / 时间: {now_str}\n"
+                    f"Invite / 链接: {link.invite_link}"
                 ),
             )
         except Exception:
@@ -309,15 +334,49 @@ async def _poll_payments(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_resetcounter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Set wallet_index_counter.next_idx to 10, skipping all previously used addresses."""
+    """Advance wallet_index_counter to a specific value (only ever increases).
+
+    Usage:
+      /resetcounter <value>   — set counter to <value> (rejected if <= current)
+      /resetcounter           — advance counter by +100
+    """
     if update.effective_user.id != ADMIN_TG_ID:
         await update.message.reply_text("Unauthorized.")
         return
+
     with db._conn() as con:
-        con.execute("UPDATE wallet_index_counter SET next_idx = 10 WHERE id = 1")
+        current_row = con.execute(
+            "SELECT next_idx FROM wallet_index_counter WHERE id = 1"
+        ).fetchone()
+        current = current_row[0] if current_row else 0
+
+        if context.args:
+            try:
+                target = int(context.args[0])
+            except ValueError:
+                await update.message.reply_text("Usage: /resetcounter [new_value]")
+                return
+            if target <= current:
+                await update.message.reply_text(
+                    f"Rejected: {target} <= current value {current}.\n"
+                    f"Counter can only increase to prevent address reuse.\n"
+                    f"当前值 {current}，目标值 {target} 不合法，计数器只能增加。"
+                )
+                return
+            con.execute(
+                "UPDATE wallet_index_counter SET next_idx = ? WHERE id = 1", (target,)
+            )
+            new_val = target
+        else:
+            row = con.execute(
+                "UPDATE wallet_index_counter SET next_idx = next_idx + 100 "
+                "WHERE id = 1 RETURNING next_idx"
+            ).fetchone()
+            new_val = row[0]
+
     await update.message.reply_text(
-        "Done. wallet_index_counter.next_idx set to 10.\n"
-        "计数器已设为 10，后续新用户将从地址索引 10 开始派生。"
+        f"Done. Counter: {current} -> {new_val}\n"
+        f"计数器已从 {current} 推进到 {new_val}，后续新用户将从该索引派生全新地址。"
     )
 
 
@@ -383,6 +442,13 @@ async def _check_expiry(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def main() -> None:
     db.init_db()
+
+    if not ADMIN_TG_ID:
+        logger.warning(
+            "ADMIN_TG_ID is 0 or not set — all admin commands (/stats, /resetdb, "
+            "/checkorder, /checkbalance, /dbinfo, /resetcounter) are DISABLED. "
+            "Set ADMIN_TG_ID in your environment variables."
+        )
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))

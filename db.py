@@ -89,19 +89,6 @@ def create_user(tg_user_id: int, wallet_idx: int, address: str) -> None:
         )
 
 
-def upsert_nowpayment(tg_user_id: int, pay_address: str, payment_id: str) -> None:
-    """Create or refresh a NOWPayments order for an unpaid user."""
-    with _conn() as con:
-        # Try to insert; if user already exists and is unpaid, update payment details
-        con.execute("""
-            INSERT INTO users (tg_user_id, wallet_idx, address, payment_id)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(tg_user_id) DO UPDATE SET
-                address    = excluded.address,
-                payment_id = excluded.payment_id
-            WHERE paid = 0
-        """, (tg_user_id, tg_user_id, pay_address, payment_id))
-
 
 def get_all_addresses() -> set:
     """Return a set of all addresses currently in the DB."""
